@@ -1,0 +1,744 @@
+---
+title: "V_LDL analysis"
+author: "Ren Xie"
+date: "2/19/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(eval = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+
+```
+
+load in data
+```{r 1, echo = T, eval = T}
+library(ggplot2)
+library(lme4)
+library(reshape2)
+library(dplyr)
+################import data ##################################
+load("D:/Bioinformatics and system biology/YEAR 2/Age group/Project/Linear mixed model/dts_hotel_project/load_to_R/data.Rdata")
+common_columns = colnames(data$data_r)[1:3] #select columns of categorical variables
+multi.colnames <-  colnames(data$data_r)[grep('XL_VLDL_.{0,3}.$', colnames(data$data_r))] #select metabolites of chylomicron XXL AND XL VLDL
+multi.colnames <- c(multi.colnames, colnames(data$data_r)[grep('._LDL_.{0,3}.$', colnames(data$data_r))]) #select metabolites of LDL
+V_LDL = data$data_r[c(common_columns, multi.colnames)] #loaded select metabolites into an dataframe
+
+#Missing value checking
+sapply(V_LDL, function(x) sum(is.na(x))) #check for missing value
+V_LDL[rowSums(is.na(V_LDL)) > 0,]#show the row with missing value
+```
+
+Standardization and preprocessing
+
+```{r 2, echo = T, eval = T, warning= FALSE}
+################standardization by individual variance from baseline (time point 1) #############
+baseline <- filter(V_LDL, V_LDL$Time == 1) #select value at time point 1
+baseline.sd <- apply(baseline[,-c(1:3)], 2, sd)#calculate standard deviation of baseline
+V_LDL.ori <- V_LDL #save the non-standardized data
+
+#standardize the data
+V_LDL.standardized <- V_LDL
+V_LDL.standardized[,-c(1:3)] <- sweep(V_LDL.standardized[,-c(1:3)],2,baseline.sd,'/') 
+V_LDL <- V_LDL.standardized 
+
+################preprocess the data #############
+V_LDL$treatment <- stringr::str_split_fixed(V_LDL$ID, '_', 2)[,2] #create treatment column
+V_LDL$treatment = as.factor(V_LDL$treatment)
+
+V_LDL.melt = melt(V_LDL, id.vars = c('particpant', 'treatment' , 'Time'), measure.vars = multi.colnames, variable.name = 'measurements') #convert wide format to long format
+V_LDL.melt$particpant <- as.factor(V_LDL.melt$particpant)
+V_LDL.melt$measurements <- as.factor(V_LDL.melt$measurements)
+
+V_LDL.melt <- V_LDL.melt[!(V_LDL.melt$value == 0 & V_LDL.melt$particpant == 'P012' & V_LDL.melt$treatment == 'A'),] #deal with missing value in LDL by deleting them
+summary(V_LDL.melt)
+
+car_var <- c('measurements', 'particpant', 'treatment', 'ID', 'num_timing', 'Time') #list of categorical variables in dataset
+#visulize the dataset
+fig_tl = ggplot(V_LDL.melt, aes(x = Time, y = value , group = interaction(particpant, treatment) )) +
+  facet_wrap(~measurements) +
+  geom_line(aes(colour = treatment))
+fig_tl
+
+```
+create frame for desgin matrix
+```{r 3, echo = T, eval = T, results='asis' }
+
+#############3 degree model desgin matrix ##############
+#loading polynomial functions
+source('../../Software/DifferentFunctionalForms.R')
+
+#making dummy dataframe of time points
+dummies_data = data.frame(diag(11)) 
+dummies_colnames = ''
+for (i in 1:11) {
+  dummies_colnames[i] = paste0("time",i)
+}
+colnames(dummies_data) = dummies_colnames
+dummies_data$num_timing=seq(1,11)
+
+#set knot and make dummies for desgin matrix
+knot1 = 2
+dummies = linear_third_pw_myway(dummies_data, knot1)
+knitr::kable(dummies, "pipe")
+```
+Model building
+``````{r 4, echo = T, eval = T, warning = TRUE}
+################model building#############
+data.melt <- V_LDL.melt
+
+#create empty list for parameters
+fix_parameters.list <- list()
+rand_parameters <- list()
+
+#create dataframe for  Akaike information criterion (AIC), evaluation of model likelihood 
+V_LDL.aic <-  data.frame(row.names = unique(data.melt$measurements))
+V_LDL.aic$AIC <- 0
+lm_list <- list()
+
+#build models per metabolite in the dataset
+for (mea in  levels(data.melt$measurements)) {
+
+  cur_position <- match(mea, unique(data.melt$measurements)) #current position in the loop
+  print(paste0(cur_position, "/",length(unique(data.melt$measurements)))) #showing the progress
+  temp_mea = dplyr::filter(data.melt, measurements == mea) #create temporary subset of a metabolite
+  colnames(temp_mea)[which(colnames(temp_mea) == 'Time')] = 'num_timing'  #since num_timming is default colnames in piece wise linear model
+  temp_mea = plyr::join(temp_mea, dummies) #joining temporary dataset with dummies
+  
+  lm_temp = lmer(value ~  num_timing1*treatment  + num_timing2*treatment + num_timing1b*treatment + num_timing3 * treatment +  treatment+
+                   (num_timing1*treatment + num_timing2*treatment +  num_timing1b*treatment + num_timing3 * treatment +  treatment |particpant ),
+                 data = temp_mea,  REML=FALSE)
+  lm_list[[mea]] <- lm_temp #save the model
+  rand_parameters[[mea]] <-  ranef(lm_temp) #save the parameters of random effect
+  V_LDL.aic[mea,] <-  AIC(logLik(lm_temp)) #save the AIC value
+  fix_parameters.list[[mea]] <-  fixef(lm_temp) #save the parameters of fixed effect
+}
+
+```
+Extracted fixed effect
+```{r 5, echo = T, eval = T, results='asis' }
+###################################extract fix effect##################
+df.fix_parameters <- data.frame() #create data frame for random effect of interaction between treatment and individual
+for(mea in names(fix_parameters.list)){
+  #show the progress
+  # cur_position <- match(mea, names(fix_parameters.list)) #find your current position
+  # print(paste0(cur_position, "/",length(names(fix_parameters.list)))) #show the progress
+  
+  #unpack the list of random effect parameters
+  mea.fix_parameters <- as.data.frame(t(fix_parameters.list[[mea]]))  #extract 'treatment and individual interaction' random effect parameter per measurement
+  
+  #add additional information
+  mea.fix_parameters$measurements <- as.factor(mea) #add measurement column
+  
+  
+  df.fix_parameters <- rbind(df.fix_parameters,mea.fix_parameters)#add individual dataframe into whole data frame 'interaction '
+}
+row.names(df.fix_parameters) <- df.fix_parameters$measurements #change the rownames
+
+df.fix_parameters <- as.data.frame(t(df.fix_parameters))
+
+#calculate fixed effect matrix
+fix_effect <- data.frame()
+fix_effect.percolumn <- data.frame()
+for (mea in names(lm_list)){
+  temp.fix_effect <- model.matrix(lm_list[[mea]]) %*% fixef(lm_list[[mea]]) #fixed effect
+  temp.fix_effect.percolumn <- sweep(model.matrix(lm_list[[mea]]), 2, fixef(lm_list[[mea]]), '*') #fixed effect per column of design matrix
+  
+  temp.fix_effect <- data.frame('Estimated_fixed'=temp.fix_effect)
+  temp.fix_effect.percolumn <- as.data.frame(temp.fix_effect.percolumn)
+  
+  
+  temp.fix_effect$measurements <- as.factor(mea)
+  temp.fix_effect.percolumn$measurements <- as.factor(mea)
+  
+  
+  temp.fix_effect <- cbind(dplyr::filter(data.melt, measurements == mea)[1:3], temp.fix_effect)#adding categorical variable
+  temp.fix_effect.percolumn <- cbind(dplyr::filter(data.melt, measurements == mea)[1:3], temp.fix_effect.percolumn)#adding categorical variable
+  
+  fix_effect <- rbind(fix_effect, temp.fix_effect)
+  fix_effect.percolumn <- rbind(fix_effect.percolumn, temp.fix_effect.percolumn)
+}
+fix_effect <- dplyr::filter(fix_effect, particpant == 'P001') #fixed effect is same for every subjects, so only one of them is enough
+summary(fix_effect)
+```
+visualization fixed effect
+``````{r 6, echo = T, eval = T, results='asis' }
+###################################Visualization fixed effect #################
+#visualize the fixed effect
+
+fig <- ggplot(fix_effect)
+fig <- fig + geom_line(aes(x = Time, y = Estimated_fixed, colour = treatment))
+fig <- fig + facet_wrap(~measurements)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks = unique(fixed_effect.visual$Time))
+fig <- fig + xlab('Time point') + ylab('Standardized concentration')
+fig
+
+```
+Extract random effect
+```{r 7, echo = T, eval = T, results='asis' }
+#########################Extract random effect###########
+random_parameters.list <- rand_parameters #should be a list
+random_effect.percolumn <- data.frame()
+random_effect <- data.frame()
+for (mea in names(lm_list)){
+  temp_matrix <- model.matrix(lm_list[[mea]]) #extract design matrix
+  temp_matrix <- cbind(dplyr::filter(data.melt, measurements == mea)[colnames(data.melt) %in% car_var[!car_var %in% 'measurements']], temp_matrix)#combined with categorical variable
+  temp_random_parameter <-  as.matrix(random_parameters.list[[mea]]$particpant) #extract dataframe of random parameters of one metabolite
+  #extract random parameters for each subject
+  for (indi in unique(data.melt$particpant)){
+    temp_matrix.indi <- dplyr::filter(temp_matrix, particpant == indi)[!colnames(temp_matrix) %in% car_var] #design matrix for single subject
+    temp.random_effect.percolumn <- sweep(as.matrix(temp_matrix.indi), 2, temp_random_parameter[indi,], '*')#column wise random effect (random effect per feature)
+    temp.random_effect <- as.matrix(temp_matrix.indi) %*% temp_random_parameter[indi,]#calculate total random effect
+    
+    temp.random_effect <- data.frame('Estimated_random'=temp.random_effect) #create dataframe for store random effect
+    temp.random_effect.percolumn <- as.data.frame(temp.random_effect.percolumn)
+    
+    temp.random_effect.percolumn$measurements <- as.factor(mea)
+    temp.random_effect$measurements <- as.factor(mea)
+    
+    temp.categorical <- dplyr::filter(temp_matrix, particpant == indi)[colnames(temp_matrix) %in% car_var[!car_var %in% 'measurements']]
+    temp.random_effect.percolumn <- cbind(temp.categorical, temp.random_effect.percolumn)
+    temp.random_effect <- cbind(temp.categorical, temp.random_effect)
+    
+    random_effect.percolumn <- rbind(random_effect.percolumn, temp.random_effect.percolumn)
+    random_effect <- rbind(random_effect, temp.random_effect)
+  }
+}
+```
+
+Visualization random effect
+```{r 8, echo = T, eval = T, results='asis' }
+##################Visualization random effect #################
+#construct a matrix with random effect per individual
+fig <- ggplot(random_effect)
+fig <- fig + geom_point(aes(x = Time, y = Estimated_random, colour = treatment))
+fig <- fig + facet_wrap(~particpant)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks = unique(random_effect$Time))
+fig <- fig + xlab('Time point') + ylab('Value')
+fig
+
+```
+Significance test
+```{r 9, echo = T, eval = T, results='asis', warning=F }
+################Significance test ##########
+Model_quality.list <- list() #Quality of models
+sig.rand_parameters.list <- list() #list of lists of parameters of random effect
+sig.fix_parameters.list <- list()# list of lists of  parameters of fixed effect
+sig.lm_list <- list() #list of lists of models
+
+for (indi in levels(data.melt$particpant)){ # loop to exclude one subject out of dataset
+  
+  cur_position <- match(indi, levels(data.melt$particpant)) #position 
+  print(paste0(indi, ": " ,cur_position, "/",nlevels(data.melt$particpant))) #print the postion of progress
+    
+  temp.melt <- dplyr::filter(data.melt, !particpant == indi) #One subject excluded from the dataset
+
+  #create temporary a list and a dataframe for storing parameters
+  temp.sig.fix_parameters.list<- list()
+  temp.sig.rand_parameters.list <- list()
+  temp.model_quality <-  data.frame(row.names = unique(data.melt$measurements))
+  temp.model_quality$AIC <- 0
+  temp.model_quality$Loglik <- 0
+  temp.lm_list <- list()
+  
+  
+  for (mea in  levels(data.melt$measurements)) { #loop through all metabolites
+    cur_position <- match(mea, unique(data.melt$measurements)) #position 
+    print(paste0(mea, ": " ,cur_position, "/",length(unique(data.melt$measurements)))) #print the postion of progress
+    
+    sig.temp_mea = dplyr::filter(temp.melt, measurements == mea) #extract temporary dataset for one measuremnt
+    colnames(sig.temp_mea)[which(colnames(sig.temp_mea) == 'Time')] = 'num_timing'  #since num_timming is default colnames in piece wise linear model
+    sig.temp_mea = plyr::join(sig.temp_mea, dummies) #join with dummies
+    
+    sig.lm_temp = lmer(value ~  num_timing1*treatment  + num_timing2*treatment + num_timing1b*treatment + num_timing3 * treatment +  treatment+
+                     (num_timing1*treatment + num_timing2*treatment +  num_timing1b*treatment + num_timing3 * treatment +  treatment |particpant ),
+                   data = sig.temp_mea,  REML=FALSE) # build model for each subset
+    temp.lm_list[[mea]] <- sig.lm_temp #store the modle
+    temp.sig.rand_parameters.list[[mea]] <-  ranef(sig.lm_temp) #store random effect
+    temp.sig.fix_parameters.list[[mea]] <-  fixef(sig.lm_temp) #store fixed effect
+
+    temp.model_quality[mea,'AIC'] <-  AIC(logLik(sig.lm_temp)) #store AIC score
+    temp.model_quality[mea,'Loglik'] <-  logLik(sig.lm_temp) #store log Likelyhood 
+  }
+  Model_quality.list[[indi]] <- temp.model_quality 
+  sig.rand_parameters.list[[indi]] <- temp.sig.rand_parameters.list #store list of random parameter from exclude one subject into a total list
+  sig.fix_parameters.list[[indi]] <- temp.sig.fix_parameters.list #store list of fixed  parameter from exclude one subject into a total list
+  sig.lm_list[[indi]] <- temp.lm_list
+  
+}
+```
+significance test: extract fixed effect 
+```{r 10}
+################significance test: extract fixed effect ##########
+sig.fix_effect.percolumn <- data.frame() #set a data frame to store fixed effect (per feature of design matrix) from significant test 
+sig.fix_effect <- data.frame() #set a data frame to store fixed effect from significant test 
+
+
+for (indi in names(sig.lm_list)){
+  gather.fix_effect.percolumn <- data.frame() #a temporary dataset for per feature 
+  gather.fix_effect <- data.frame() 
+
+  
+  for (mea in names(sig.lm_list[[indi]])){
+    temp.sig.fixed_effect.percolumn <- sweep(model.matrix(sig.lm_list[[indi]][[mea]]), 2, fixef(sig.lm_list[[indi]][[mea]]), '*') #column wise multiple with the parameter, calculate fixed effect per feature without add them together
+    temp.sig.fixed_effect <- model.matrix(sig.lm_list[[indi]][[mea]]) %*% fixef(sig.lm_list[[indi]][[mea]]) #calculate the fixed effect
+    
+    temp.sig.fixed_effect.percolumn <- data.frame('value' = temp.sig.fixed_effect.percolumn) 
+    temp.sig.fixed_effect.percolumn <- cbind(dplyr::filter(data.melt, measurements == mea & (!particpant == indi))[1:4], temp.sig.fixed_effect.percolumn)
+    temp.sig.fixed_effect.percolumn$one_leave <- as.factor(indi)
+    gather.fix_effect.percolumn <- rbind(gather.fix_effect.percolumn, temp.sig.fixed_effect.percolumn)
+    
+    temp.sig.fixed_effect <- data.frame('value'=temp.sig.fixed_effect)
+    temp.sig.fixed_effect <- cbind(dplyr::filter(data.melt, measurements == mea & (!particpant == indi))[1:4], temp.sig.fixed_effect)
+    temp.sig.fixed_effect$one_leave <- as.factor(indi)
+    gather.fix_effect <- rbind(gather.fix_effect, temp.sig.fixed_effect)
+    
+  }
+  #since fixed effect is same for all subject, so only one of them will be kept
+  if ('P001' %in% unique(gather.fix_effect.percolumn$particpant)) {
+    gather.fix_effect.percolumn <- dplyr::filter(gather.fix_effect.percolumn, particpant == 'P001')
+    sig.fix_effect.percolumn <- rbind(sig.fix_effect.percolumn, gather.fix_effect.percolumn)
+    
+    gather.fix_effect <- dplyr::filter(gather.fix_effect, particpant == 'P001')
+    sig.fix_effect <- rbind(sig.fix_effect, gather.fix_effect)
+    
+  } else{
+    gather.fix_effect.percolumn <- dplyr::filter(gather.fix_effect.percolumn, particpant == 'P002')
+    sig.fix_effect.percolumn <- rbind(sig.fix_effect.percolumn, gather.fix_effect.percolumn)
+    
+    gather.fix_effect <- dplyr::filter(gather.fix_effect, particpant == 'P002')
+    sig.fix_effect <- rbind(sig.fix_effect, gather.fix_effect)
+  }
+}
+
+summary(sig.fix_effect)
+
+```
+significance test: extract random effect
+```{r 11}
+#####################significance test: extract random effect###################
+sig.random_effect.percolumn <- data.frame() #set a data frame to store random effect (per feature of design matrix) from significant test 
+sig.random_effect <- data.frame() #set a data frame to store random effect from significant test 
+
+#progress bar
+pb <- progress::progress_bar$new(
+  format = "  Progress [:bar] :percent",
+  total = length(sig.rand_parameters.list), clear = FALSE, width= 60)
+
+#extract random effect
+for (indi_left in names(sig.rand_parameters.list)){
+  pb$tick()
+  Sys.sleep(1 / 100)
+  
+  # cur_position <- match(indi_left, names(sig.rand_parameters.list)) #position 
+  # print(paste0(cur_position, "/",length(sig.rand_parameters.list))) #print the potion of progress
+  
+  #loop through all the methods
+  for (mea in names(sig.lm_list[[indi_left]])){
+    temp.matrix <- model.matrix(sig.lm_list[[indi_left]][[mea]]) #extract design matrix
+    temp.matrix <- cbind(dplyr::filter(data.melt, measurements == mea & (!particpant == indi_left))[1:4], temp.matrix) #extract the part of design matrix of the certain measurement and without the left out subject
+    temp.sig.random_parameter <-  as.matrix(sig.rand_parameters.list[[indi_left]][[mea]]$particpant) #extract the corresponding parameters
+    
+    for (indi in unique(temp.matrix$particpant)){
+      temp.matrix.indi <- dplyr::filter(temp.matrix, particpant == indi)[!colnames(temp.matrix) %in% car_var] #extract the part of design matrix for certain individual
+      temp.sig.random_effect.percolumn <- sweep(as.matrix(temp.matrix.indi), 2, temp.sig.random_parameter[indi,], '*') #calculate random effect per feature
+      temp.sig.random_effect <- as.matrix(temp.matrix.indi) %*% temp.sig.random_parameter[indi,] #calculate total random effect
+      
+      temp.sig.random_effect.percolumn <- data.frame('value'= temp.sig.random_effect.percolumn)
+      temp.sig.random_effect.percolumn <- cbind(dplyr::filter(temp.matrix, particpant == indi)[1:4], temp.sig.random_effect.percolumn)
+      temp.sig.random_effect.percolumn$one_leave <- as.factor(indi_left)
+      sig.random_effect.percolumn <- rbind(sig.random_effect.percolumn, temp.sig.random_effect.percolumn)
+      
+      temp.sig.random_effect <- data.frame('value'= temp.sig.random_effect)
+      temp.sig.random_effect <- cbind(dplyr::filter(temp.matrix, particpant == indi)[1:4], temp.sig.random_effect)
+      temp.sig.random_effect$one_leave <- as.factor(indi_left)
+      sig.random_effect <- rbind(sig.random_effect, temp.sig.random_effect)
+    }
+  }
+}
+
+summary(sig.random_effect)
+
+```
+PCA of original effect matrices
+```{r 12}
+######################PCA of original effect matrices#############
+######################PCA of fixed effect#############
+
+fixed_effect.wide <- tidyr::spread(fix_effect, measurements, Estimated_fixed ) #convert fixed effect from long form to wide form
+summary(fixed_effect.wide)
+
+fixed_effect.wide.pca <- prcomp(fixed_effect.wide[!colnames(fixed_effect.wide) %in% car_var], scale. = FALSE) #perform PCA
+fixed_effect.wide.score <- as.data.frame(fixed_effect.wide.pca$x[,n_PCs.perserved.names])
+fixed_effect.wide.score <- cbind(fixed_effect.wide[1:3], fixed_effect.wide.score)#store score
+fixed_effect.wide.loading <- as.data.frame(fixed_effect.wide.pca$rotation[,n_PCs.perserved.names]) #store loading
+fixed_effect.wide.loading$measurements <- rownames(fixed_effect.wide.loading)
+
+fixed_effect.wide.PCexplain <- data.frame('value'= as.vector(fixed_effect.wide.pca$sdev^2/sum(fixed_effect.wide.pca$sdev^2)), 
+                                          row.names = colnames(fixed_effect.wide.pca$rotation)) #store the explanation rates per PC
+
+
+
+######################PCA of random effect#############
+random_effect.wide <- tidyr::spread(random_effect, measurements, Estimated_random ) #convert random effect from long form to wide form
+random_effect.nas <- random_effect.wide[random_effect.wide$Time %in% c(8,9,10,11) & random_effect.wide$particpant == 'P012',] #the part of random effect matrix with missing value
+random_effect.nnas <- random_effect.wide[!(random_effect.wide$Time %in% c(8,9,10,11) & random_effect.wide$particpant == 'P012'),]#exclude all missing value point
+sapply(random_effect.nnas, function(x) sum(is.na(x)))
+
+random_effect.nnas.pca <- prcomp(random_effect.nnas[!colnames(random_effect.nnas) %in% car_var], scale. = FALSE) 
+random_effect.nnas.score <- as.data.frame(random_effect.nnas.pca$x[,n_PCs.perserved.names])
+random_effect.nnas.score <- cbind(random_effect.nnas[1:3], random_effect.nnas.score)
+random_effect.nnas.loading <- as.data.frame(random_effect.nnas.pca$rotation[,n_PCs.perserved.names])
+random_effect.nnas.loading$measurements <- rownames(random_effect.nnas.loading)
+
+random_effect.nnas.PCexplain <- data.frame('value'= as.vector(random_effect.nnas.pca$sdev^2/sum(random_effect.nnas.pca$sdev^2)), 
+                                          row.names = colnames(random_effect.nnas.pca$rotation))
+
+factoextra::fviz_eig(fixed_effect.wide.pca, title = 'Fixed effect')
+factoextra::fviz_eig(random_effect.nnas.pca, title = 'Random effect')
+
+```
+PCA of fixed effect matrices from significant test
+```{r 13}
+#####################PCA of fixed effect matrices from significant test##################
+sig.fixed_effect.wide <- tidyr::spread(sig.fix_effect, measurements, value) #convert long form fixed effect significant test result to long format
+summary(sig.fixed_effect.wide)
+sig.fixed_pca.score.list <- list()
+sig.fixed_pca.loading.list <- list()
+temp_df.PCexplain.one_leave <- c()
+sig.fixed_pca.PCexplained <- data.frame(stringsAsFactors = FALSE)
+n_PCs.perserved <- 6
+
+for (indi in levels(sig.fixed_effect.wide$one_leave)){
+  temp_df <- dplyr::filter(sig.fixed_effect.wide, one_leave == indi)
+  temp_df.cat <- temp_df[colnames(temp_df) %in% car_var]
+  temp_df <- temp_df[!colnames(temp_df) %in% car_var]
+  
+  temp_df.pca <- prcomp(temp_df)
+  
+  temp_df.score <- temp_df.pca$x[,1:n_PCs]
+  temp_df.score <- cbind(temp_df.cat,temp_df.score)
+  sig.fixed_pca.score.list[[indi]] <- temp_df.score
+  
+  temp_df.loading <- temp_df.pca$rotation[,1:n_PCs.perserved]
+  sig.fixed_pca.loading.list[[indi]] <- temp_df.loading
+  
+  temp_df.PCexplain <- as.vector(temp_df.pca$sdev^2/sum(temp_df.pca$sdev^2))[1:n_PCs.perserved]
+  temp_df.PCexplain.one_leave <- c(temp_df.PCexplain.one_leave,indi)
+  sig.fixed_pca.PCexplained <- rbind(sig.fixed_pca.PCexplained, temp_df.PCexplain)
+}
+n_PCs.perserved.names <- paste0('PC',seq(1:n_PCs.perserved))
+colnames(sig.fixed_pca.PCexplained) <- n_PCs.perserved.names
+sig.fixed_pca.PCexplained$one_leave <- as.factor(temp_df.PCexplain.one_leave)
+summary(sig.fixed_pca.PCexplained)
+
+
+
+sig.fixed.rotated_loading <- data.frame()
+sig.fixed.rotated_score <- data.frame()
+n_PCs <- 3
+n_PCs.names <- paste0('PC',seq(1:n_PCs))
+
+for (indi in names(sig.fixed_pca.score.list)){
+  temp_df.score <- sig.fixed_pca.score.list[[indi]]
+  temp_df.loading <- sig.fixed_pca.loading.list[[indi]]
+  
+  temp.loading.rotaiton <- vegan::procrustes(fixed_effect.wide.pca$rotation[,1:n_PCs] ,temp_df.loading[,1:n_PCs])
+  temp_df.loading.rotated <- apply(temp.loading.rotaiton$Yrot, 1, function(x) x +as.vector(attr(temp.loading.rotaiton$X, "scaled:center")) )
+  temp_df.loading.rotated <- as.data.frame(temp_df.loading.rotated)
+  temp_df.loading.rotated$PCs <- as.factor(n_PCs.names)
+  temp_df.loading.rotated$one_leave <- as.factor(indi)
+  
+  sig.fixed.rotated_loading <- rbind(sig.fixed.rotated_loading, temp_df.loading.rotated)
+  
+  temp_df.score.rotated <- as.matrix(temp_df.score[n_PCs.names]) %*% solve(temp.loading.rotaiton$rotation)
+  colnames(temp_df.score.rotated) <- n_PCs.names
+  temp_df.score.rotated <- cbind(temp_df.score[colnames(temp_df.score) %in% car_var],temp_df.score.rotated )
+  sig.fixed.rotated_score <- rbind(sig.fixed.rotated_score, temp_df.score.rotated)
+}
+
+score.intervals <- data.frame()
+for(pc in n_PCs.names){
+  temp.rotated_score <- sig.fixed.rotated_score %>% select(colnames(sig.fixed.rotated_score)[colnames(sig.fixed.rotated_score) %in% car_var], pc)
+  temp.fixed_effect.score <- fixed_effect.wide.score %>% select(colnames(fixed_effect.wide.score)[colnames(fixed_effect.wide.score) %in% car_var], pc)
+  
+  temp.rotated_score$particpant <- NULL
+  temp.fixed_effect.score$particpant <- NULL
+  temp.rotated_score <- tidyr::spread(temp.rotated_score, one_leave, pc)
+  temp.rotated_score <- plyr::join(temp.rotated_score, temp.fixed_effect.score)
+  
+  temp.intervals <- temp.rotated_score[colnames(temp.rotated_score) %in% car_var]
+  temp.intervals$PCs <- as.factor(pc)
+  temp.intervals$q2.5 <- apply(temp.rotated_score[!colnames(temp.rotated_score) %in% car_var], 1, function(x) quantile(x,.025, na.rm = TRUE))
+  temp.intervals$q97.5 <- apply(temp.rotated_score[!colnames(temp.rotated_score) %in% car_var], 1, function(x) quantile(x,.975,na.rm = TRUE))
+  temp.intervals$sd <- apply(temp.rotated_score[!colnames(temp.rotated_score) %in% car_var], 1, function(x) sd(x, na.rm = TRUE))
+  
+  score.intervals <- rbind(score.intervals, temp.intervals)
+}
+
+loading.intervals <- data.frame()
+
+for(pc in n_PCs.names){
+  temp.rotated_loading <- filter(sig.fixed.rotated_loading, PCs == pc)[multi.colnames]
+  temp.fixed_effect.loading <-fixed_effect.wide.loading %>% select(colnames(fixed_effect.wide.loading)[colnames(fixed_effect.wide.loading) %in% car_var], pc)
+  
+  temp.rotated_loading <- as.data.frame(t(temp.rotated_loading))
+  temp.rotated_loading$measurements <- row.names(temp.rotated_loading)
+  temp.rotated_loading <- plyr::join(temp.rotated_loading, temp.fixed_effect.loading)
+  
+  temp.intervals <- temp.rotated_loading[colnames(temp.rotated_loading) %in% car_var]
+  temp.intervals$PCs <- as.factor(pc)
+  temp.intervals$q2.5 <- apply(temp.rotated_loading[!colnames(temp.rotated_loading) %in% car_var], 1, function(x) quantile(as.numeric(x),.025, na.rm = TRUE))
+  temp.intervals$q97.5 <- apply(temp.rotated_loading[!colnames(temp.rotated_loading) %in% car_var], 1, function(x) quantile(as.numeric(x),.975,na.rm = TRUE))
+  temp.intervals$sd <- apply(temp.rotated_loading[!colnames(temp.rotated_loading) %in% car_var], 1, function(x) sd(x, na.rm = TRUE))
+  
+  
+  loading.intervals <- rbind(loading.intervals, temp.intervals)
+}
+
+
+```
+Visualization score of fixed effect 
+```{r 14}
+#########################Visualization score of fixed effect##############
+fixed_effect.long.score <- melt(fixed_effect.wide.score, id.vars = c('particpant', 'treatment' , 'Time'), measure.vars = n_PCs.perserved.names,variable.name = 'PCs' )
+fixed_effect.score.withinterval <- plyr::join(fixed_effect.long.score, score.intervals)
+
+pc = 'PC1'
+fixed_effect.score.perPC <- dplyr::filter(fixed_effect.score.withinterval, PCs == pc)
+fig <- ggplot(fixed_effect.score.perPC, aes(x = Time, y = value, group = treatment))
+fig <- fig + geom_point(aes(x = Time, y = value, colour = treatment))
+fig <- fig + geom_errorbar(aes(ymin=q2.5, ymax= q97.5,colour = treatment ), width=.1)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks=seq(1,11))
+fig <- fig + xlab('Time point') + ylab(paste0(pc, ' (', round(fixed_effect.wide.PCexplain[pc,] * 100, 2), '%)'))
+
+fig
+
+pc = 'PC2'
+fixed_effect.score.perPC <- dplyr::filter(fixed_effect.score.withinterval, PCs == pc)
+fig <- ggplot(fixed_effect.score.perPC, aes(x = Time, y = value, group = treatment))
+fig <- fig + geom_point(aes(x = Time, y = value, colour = treatment))
+fig <- fig + geom_errorbar(aes(ymin=q2.5, ymax= q97.5,colour = treatment ), width=.1)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks=seq(1,11))
+fig <- fig + xlab('Time point') + ylab(paste0(pc, ' (', round(fixed_effect.wide.PCexplain[pc,] * 100, 2), '%)'))
+
+fig
+
+pc = 'PC3'
+fixed_effect.score.perPC <- dplyr::filter(fixed_effect.score.withinterval, PCs == pc)
+fig <- ggplot(fixed_effect.score.perPC, aes(x = Time, y = value, group = treatment))
+fig <- fig + geom_point(aes(x = Time, y = value, colour = treatment))
+fig <- fig + geom_errorbar(aes(ymin=q2.5, ymax= q97.5,colour = treatment ), width=.1)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks=seq(1,11))
+fig <- fig + xlab('Time point') + ylab(paste0(pc, ' (', round(fixed_effect.wide.PCexplain[pc,] * 100, 2), '%)'))
+
+fig
+
+
+```
+Visualization loading of fixed effect 
+```{r 15}
+#########################Visualization loading of fixed effect ##############
+fixed_effect.long.loading <- melt(fixed_effect.wide.loading, id.vars = c('measurements'), measure.vars = n_PCs.perserved.names,variable.name = 'PCs' )
+fixed_effect.loading.withinterval <- plyr::join(fixed_effect.long.loading, loading.intervals)
+
+pc = 'PC1'
+fixed_effect.loading.perPC <- dplyr::filter(fixed_effect.loading.withinterval, PCs == pc)
+fig.loading <- ggplot(fixed_effect.loading.perPC, aes(x= measurements, y = value)) + 
+  geom_bar(stat = "identity", fill = 'steelblue',  width = 0.9, colour="black", position = position_dodge(width = 1)) + geom_errorbar(aes(ymin= q2.5, ymax= q97.5, color = 'red'), width=.1) +
+  xlab('Measurements') + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none") +  ylab(paste0(pc,' (', round(fixed_effect.wide.PCexplain[pc,] * 100, 2), '%)'))
+fig.loading
+
+pc = 'PC2'
+ fixed_effect.loading.perPC <- dplyr::filter(fixed_effect.loading.withinterval, PCs == pc)
+fig.loading <- ggplot(fixed_effect.loading.perPC, aes(x= measurements, y = value)) + 
+  geom_bar(stat = "identity", fill = 'steelblue',  width = 0.9, colour="black", position = position_dodge(width = 1)) + geom_errorbar(aes(ymin= q2.5, ymax= q97.5, color = 'red'), width=.1) +
+  xlab('Measurements') + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none") +  ylab(paste0(pc,' (', round(fixed_effect.wide.PCexplain[pc,] * 100, 2), '%)'))
+fig.loading
+
+pc = 'PC3'
+fixed_effect.loading.perPC <- dplyr::filter(fixed_effect.loading.withinterval, PCs == pc)
+fig.loading <- ggplot(fixed_effect.loading.perPC, aes(x= measurements, y = value)) + 
+  geom_bar(stat = "identity", fill = 'steelblue',  width = 0.9, colour="black", position = position_dodge(width = 1)) + geom_errorbar(aes(ymin= q2.5, ymax= q97.5, color = 'red'), width=.1) +
+  xlab('Measurements') + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none") +  ylab(paste0(pc,' (', round(fixed_effect.wide.PCexplain[pc,] * 100, 2), '%)'))
+fig.loading
+
+loading.map <- factoextra::fviz_pca_var(fixed_effect.wide.pca,geom = c('point', 'text') , repel = TRUE, gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),col.var = 'black') + 
+    xlab(paste0('PC1 (', round(fixed_effect.wide.PCexplain['PC1',] * 100, 2), '%)')) + ylab(paste0('PC2 (', round(fixed_effect.wide.PCexplain['PC2',] * 100, 2), '%)')) + theme_bw() + ggtitle('Individual loading')
+loading.map
+  
+```
+Visualization score of random effect 
+```{r 16}
+#########################Visualization score of random effect##############
+random_effect.long.score <- melt(random_effect.nnas.score, id.vars = c('particpant', 'treatment' , 'Time'), measure.vars = n_PCs.perserved.names,variable.name = 'PCs' )
+
+pc = 'PC1'
+random_effect.score.perPC <- dplyr::filter(random_effect.long.score, PCs == pc)
+fig <- ggplot(random_effect.score.perPC, aes(x = Time, y = value, group = treatment))
+fig <- fig + geom_point(aes(x = Time, y = value, colour = treatment))
+fig <- fig + facet_wrap(~particpant)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks=seq(1,11))
+fig <- fig + xlab('Time point') + ylab(paste0(pc, ' (', round(random_effect.nnas.PCexplain[pc,] * 100, 2), '%)'))
+
+fig
+
+pc = 'PC2'
+random_effect.score.perPC <- dplyr::filter(random_effect.long.score, PCs == pc)
+fig <- ggplot(random_effect.score.perPC, aes(x = Time, y = value, group = treatment))
+fig <- fig + geom_point(aes(x = Time, y = value, colour = treatment))
+fig <- fig + facet_wrap(~particpant)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks=seq(1,11))
+fig <- fig + xlab('Time point') + ylab(paste0(pc, ' (', round(random_effect.nnas.PCexplain[pc,] * 100, 2), '%)'))
+
+fig
+
+pc = 'PC3'
+random_effect.score.perPC <- dplyr::filter(random_effect.long.score, PCs == pc)
+fig <- ggplot(random_effect.score.perPC, aes(x = Time, y = value, group = treatment))
+fig <- fig + geom_point(aes(x = Time, y = value, colour = treatment))
+fig <- fig + facet_wrap(~particpant)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks=seq(1,11))
+fig <- fig + xlab('Time point') + ylab(paste0(pc, ' (', round(random_effect.nnas.PCexplain[pc,] * 100, 2), '%)'))
+
+fig
+
+```
+Visualization loading of random effect 
+
+```{r 17 }
+#########################Visualization loading of random effect##############
+random_effect.long.loading <- melt(random_effect.nnas.loading, id.vars = c('measurements'), measure.vars = n_PCs.perserved.names,variable.name = 'PCs' )
+
+pc = 'PC1'
+random_effect.loading.perPC <- dplyr::filter(random_effect.long.loading, PCs == pc)
+fig.loading.random <- ggplot(random_effect.loading.perPC, aes(x= measurements, y = value)) + 
+  geom_bar(stat = "identity", fill = 'steelblue',  width = 0.9, colour="black", position = position_dodge(width = 1)) + 
+  xlab('Measurements') + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none") +  ylab(paste0(pc,' (', round(random_effect.nnas.PCexplain[pc,] * 100, 2), '%)'))
+fig.loading.random
+
+
+pc = 'PC2'
+random_effect.loading.perPC <- dplyr::filter(random_effect.long.loading, PCs == pc)
+fig.loading.random <- ggplot(random_effect.loading.perPC, aes(x= measurements, y = value)) + 
+  geom_bar(stat = "identity", fill = 'steelblue',  width = 0.9, colour="black", position = position_dodge(width = 1)) + 
+  xlab('Measurements') + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none") +  ylab(paste0(pc,' (', round(random_effect.nnas.PCexplain[pc,] * 100, 2), '%)'))
+fig.loading
+
+pc = 'PC3'
+random_effect.loading.perPC <- dplyr::filter(random_effect.long.loading, PCs == pc)
+fig.loading.random <- ggplot(random_effect.loading.perPC, aes(x= measurements, y = value)) + 
+  geom_bar(stat = "identity", fill = 'steelblue',  width = 0.9, colour="black", position = position_dodge(width = 1)) + 
+  xlab('Measurements') + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none") +  ylab(paste0(pc,' (', round(random_effect.nnas.PCexplain[pc,] * 100, 2), '%)'))
+fig.loading.random
+
+loading.map.random <- factoextra::fviz_pca_var(random_effect.nnas.pca ,geom = c('point', 'text') , repel = TRUE, gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),col.var = 'black') + 
+    xlab(paste0('PC1 (', round(random_effect.nnas.PCexplain['PC1',] * 100, 2), '%)')) + ylab(paste0('PC2 (', round(random_effect.nnas.PCexplain['PC2',] * 100, 2), '%)')) + theme_bw() + ggtitle('Measurements loading')
+loading.map.random
+
+```
+Random effect transformation
+```{r 18}
+#################################Random effect transformation###############
+random_effect.transformed.wide <- tidyr::spread(random_effect, particpant, Estimated_random)
+sapply(random_effect.transformed.wide , function(x) sum(is.na(x))) 
+
+random_effect.transformed.nns <- random_effect.transformed.wide[!colnames(random_effect.transformed.wide) %in% c('P007', 'P010', 'P012')]
+
+random_effect.transformed.nns.pca <- prcomp(random_effect.transformed.nns[!colnames(random_effect.transformed.nns) %in% car_var])
+random_effect.transformed.nns.score <- as.data.frame(random_effect.transformed.nns.pca$x[,n_PCs.perserved.names])
+random_effect.transformed.nns.score <- cbind(random_effect.transformed.nns[1:3], random_effect.transformed.nns.score)
+random_effect.transformed.nns.loading <- as.data.frame(random_effect.transformed.nns.pca$rotation[,n_PCs.perserved.names])
+random_effect.transformed.nns.loading$particpant <- rownames(random_effect.transformed.nns.loading)
+
+random_effect.transformed.nns.PCexplain <- data.frame('value'= as.vector(random_effect.transformed.nns.pca$sdev^2/sum(random_effect.transformed.nns.pca$sdev^2)), 
+                                           row.names = colnames(random_effect.transformed.nns.pca$rotation))
+
+
+factoextra::fviz_eig(random_effect.transformed.nns.pca, title = 'Transformed random effect ')
+
+```
+Visualization score of transformed random effect 
+```{r 19}
+#########################Visualization score of transformed random effect ##############
+random_effect.transformed.long.score <- melt(random_effect.transformed.nns.score, id.vars = c('measurements', 'treatment' , 'Time'), 
+                                             measure.vars = colnames(random_effect.transformed.nns.score)[!colnames(random_effect.transformed.nns.score) %in% car_var ],
+                                             variable.name = 'PCs' )
+
+pc = 'PC1'
+random_effect.transformed.score.perPC <- dplyr::filter(random_effect.transformed.long.score, PCs == pc)
+fig <- ggplot(random_effect.transformed.score.perPC, aes(x = Time, y = value, group = treatment))
+fig <- fig + geom_point(aes(x = Time, y = value, colour = treatment))
+fig <- fig + facet_wrap(~measurements)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks=seq(1,11))
+fig <- fig + xlab('Time point') + ylab(paste0(pc, ' (', round(random_effect.transformed.nns.PCexplain[pc,] * 100, 2), '%)'))
+
+fig
+
+pc = 'PC2'
+random_effect.transformed.score.perPC <- dplyr::filter(random_effect.transformed.long.score, PCs == pc)
+fig <- ggplot(random_effect.transformed.score.perPC, aes(x = Time, y = value, group = treatment))
+fig <- fig + geom_point(aes(x = Time, y = value, colour = treatment))
+fig <- fig + facet_wrap(~measurements)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks=seq(1,11))
+fig <- fig + xlab('Time point') + ylab(paste0(pc, ' (', round(random_effect.transformed.nns.PCexplain[pc,] * 100, 2), '%)'))
+
+fig
+
+pc = 'PC3'
+random_effect.transformed.score.perPC <- dplyr::filter(random_effect.transformed.long.score, PCs == pc)
+fig <- ggplot(random_effect.transformed.score.perPC, aes(x = Time, y = value, group = treatment))
+fig <- fig + geom_point(aes(x = Time, y = value, colour = treatment))
+fig <- fig + facet_wrap(~measurements)
+fig <- fig + scale_color_manual('Treatment', values = c('A' = 'red', 'B' = 'blue'))
+fig <- fig + scale_x_continuous(breaks=seq(1,11))
+fig <- fig + xlab('Time point') + ylab(paste0(pc, ' (', round(random_effect.transformed.nns.PCexplain[pc,] * 100, 2), '%)'))
+
+fig
+
+
+```
+Visualization loading of transformed random effect 
+```{r 20}
+#########################Visualization loading of transformed random effect ##############
+random_effect.transformed.long.loading <- melt(random_effect.transformed.nns.loading, id.vars = c('particpant'), measure.vars = n_PCs.perserved.names,variable.name = 'PCs' )
+
+pc = 'PC1'
+random_effect.transformed.loading.perPC <- dplyr::filter(random_effect.transformed.long.loading, PCs == pc)
+fig.loading.random <- ggplot(random_effect.transformed.loading.perPC, aes(x= particpant, y = value)) + 
+  geom_bar(stat = "identity", fill = 'steelblue',  width = 0.9, colour="black", position = position_dodge(width = 1)) + 
+  xlab('Participants') + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none") +  ylab(paste0(pc,' (', round(random_effect.transformed.nns.PCexplain[pc,] * 100, 2), '%)'))
+fig.loading.random
+
+pc = 'PC2'
+random_effect.transformed.loading.perPC <- dplyr::filter(random_effect.transformed.long.loading, PCs == pc)
+fig.loading.random <- ggplot(random_effect.transformed.loading.perPC, aes(x= particpant, y = value)) + 
+  geom_bar(stat = "identity", fill = 'steelblue',  width = 0.9, colour="black", position = position_dodge(width = 1)) + 
+  xlab('Participants') + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none") +  ylab(paste0(pc,' (', round(random_effect.transformed.nns.PCexplain[pc,] * 100, 2), '%)'))
+fig.loading.random
+
+pc = 'PC3'
+random_effect.transformed.loading.perPC <- dplyr::filter(random_effect.transformed.long.loading, PCs == pc)
+fig.loading.random <- ggplot(random_effect.transformed.loading.perPC, aes(x= particpant, y = value)) + 
+  geom_bar(stat = "identity", fill = 'steelblue',  width = 0.9, colour="black", position = position_dodge(width = 1)) + 
+  xlab('Participants') + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none") +  ylab(paste0(pc,' (', round(random_effect.transformed.nns.PCexplain[pc,] * 100, 2), '%)'))
+fig.loading.random
+
+loading.map.random <- factoextra::fviz_pca_var(random_effect.transformed.nns.pca ,geom = c('point', 'text') , repel = TRUE, gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),col.var = 'black') + 
+    xlab(paste0('PC1 (', round(random_effect.transformed.nns.PCexplain['PC1',] * 100, 2), '%)')) + ylab(paste0('PC2 (', round(random_effect.transformed.nns.PCexplain['PC2',] * 100, 2), '%)')) + theme_bw() + ggtitle('Individual loading')
+loading.map.random
+```
+
